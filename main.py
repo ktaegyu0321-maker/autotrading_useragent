@@ -135,33 +135,56 @@ def _normalize_symbol(raw_symbol: str) -> str:
     return raw_symbol.replace("/USDT:USDT", "USDT").replace("/", "")
 
 
-async def _notify_manual_position(symbol: str, pos: dict):
-    """메인서버 /api/agent/manual-position 콜백"""
+async def _post_to_central(path: str, payload: dict):
+    """공통 메인서버 콜백"""
     if not settings.central_url:
         return
     try:
         async with httpx.AsyncClient(timeout=10.0) as http:
             resp = await http.post(
-                f"{settings.central_url}/api/agent/manual-position",
-                json={
-                    "symbol": symbol,
-                    "side": pos.get("side", ""),
-                    "qty": str(pos.get("contracts", "0")),
-                    "entry_price": str(pos.get("entryPrice", "0")),
-                    "leverage": int(pos.get("leverage", 10)),
-                },
+                f"{settings.central_url}{path}",
+                json=payload,
                 headers={"Authorization": f"Bearer {settings.agent_token}"},
             )
             if resp.status_code == 200:
-                logger.info(f"[ManualDetect] 메인서버 콜백 성공: {symbol}")
+                logger.info(f"[ManualDetect] {path} 콜백 성공")
             else:
-                logger.warning(f"[ManualDetect] 메인서버 콜백 실패: {resp.status_code} {resp.text}")
+                logger.warning(f"[ManualDetect] {path} 콜백 실패: {resp.status_code} {resp.text}")
     except Exception as e:
-        logger.error(f"[ManualDetect] 콜백 오류: {e}")
+        logger.error(f"[ManualDetect] {path} 콜백 오류: {e}")
+
+
+async def _notify_manual_position(symbol: str, pos: dict, is_addon: bool):
+    """신규진입 or 추가매수 콜백"""
+    payload = {
+        "symbol": symbol,
+        "side": pos.get("side", ""),
+        "qty": str(pos.get("contracts", "0")),
+        "entry_price": str(pos.get("entryPrice", "0")),
+        "leverage": int(pos.get("leverage", 10)),
+        "is_addon": is_addon,
+        "mark_price": str(pos.get("markPrice") or pos.get("entryPrice") or "0"),
+    }
+    await _post_to_central("/api/agent/manual-position", payload)
+
+
+async def _notify_position_closed(symbol: str):
+    """청산 콜백"""
+    await _post_to_central("/api/agent/position-closed", {"symbol": symbol})
+
+
+async def _notify_position_heartbeat(symbol: str, pos: dict):
+    """MAE/MFE 업데이트용 heartbeat"""
+    payload = {
+        "symbol": symbol,
+        "mark_price": str(pos.get("markPrice") or pos.get("entryPrice") or "0"),
+        "unrealized_pnl": str(pos.get("unrealizedPnl") or "0"),
+    }
+    await _post_to_central("/api/agent/position-heartbeat", payload)
 
 
 async def detect_manual_positions():
-    """30초마다 포지션 폴링 — 수동 진입 감지 시 메인서버 콜백"""
+    """30초마다 포지션 폴링 — 수동 진입/추가매수/청산 감지 + MAE/MFE heartbeat"""
     global _known_positions, _bot_executed_symbols
     await asyncio.sleep(15)  # 시작 직후 1회 초기화
     client = get_exchange_client()
@@ -184,19 +207,41 @@ async def detect_manual_positions():
             current_map = {_normalize_symbol(p.get("symbol", "")): p for p in current_positions}
 
             for symbol, pos in current_map.items():
-                if symbol not in _known_positions:
-                    # 새 포지션 등장
+                known = _known_positions.get(symbol)
+
+                if known is None:
+                    # 신규 포지션
                     if symbol in _bot_executed_symbols:
                         _bot_executed_symbols.discard(symbol)
                         logger.info(f"[ManualDetect] 봇 진입 감지 스킵: {symbol}")
                     else:
                         logger.info(f"[ManualDetect] 수동 포지션 감지: {symbol}")
-                        await _notify_manual_position(symbol, pos)
+                        await _notify_manual_position(symbol, pos, is_addon=False)
+                else:
+                    # qty 증가 → 수동 추가매수
+                    prev_qty = float(known.get("contracts", 0) or 0)
+                    curr_qty = float(pos.get("contracts", 0) or 0)
+                    if curr_qty > prev_qty + 1e-9:
+                        if symbol in _bot_executed_symbols:
+                            _bot_executed_symbols.discard(symbol)
+                            logger.info(f"[ManualDetect] 봇 추가매수 감지 스킵: {symbol}")
+                        else:
+                            logger.info(
+                                f"[ManualDetect] 수동 추가매수 감지: {symbol} "
+                                f"qty {prev_qty} → {curr_qty}"
+                            )
+                            await _notify_manual_position(symbol, pos, is_addon=True)
+
+                    # MAE/MFE heartbeat (보유 중 포지션마다 30초마다 전송)
+                    await _notify_position_heartbeat(symbol, pos)
+
                 _known_positions[symbol] = pos
 
-            # 청산된 포지션 제거
+            # 청산 감지
             for symbol in list(_known_positions.keys()):
                 if symbol not in current_map:
+                    logger.info(f"[ManualDetect] 포지션 청산 감지: {symbol}")
+                    await _notify_position_closed(symbol)
                     del _known_positions[symbol]
 
         except Exception as e:
@@ -500,6 +545,7 @@ async def get_position(symbol: str, authorization: str = Header(None)):
             "leverage": position.leverage,
             "unrealized_pnl": str(position.unrealized_pnl),
             "stop_loss": str(position.stop_loss) if position.stop_loss else None,
+            "mark_price": str(position.mark_price) if position.mark_price else None,
         }
     except ExchangeError as e:
         raise HTTPException(status_code=502, detail=str(e))
