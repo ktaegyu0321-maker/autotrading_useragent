@@ -377,18 +377,14 @@ class AgentExchangeClient:
                 if not position:
                     logger.warning(f"No position found to set SL for {symbol}")
                     return False
-                hold_side = "long" if position.side == "LONG" else "short"
-                await self.exchange.private_mix_post_v2_mix_order_place_tpsl_order({
+                await self.exchange.private_mix_post_v2_mix_order_place_pos_tpsl({
                     "symbol": symbol,
                     "productType": "USDT-FUTURES",
                     "marginMode": "crossed",
                     "marginCoin": "USDT",
-                    "planType": "pos_loss",
-                    "triggerPrice": str(rounded_sl),
-                    "triggerType": "fill_price",
-                    "size": str(position.qty),
-                    "holdSide": hold_side,
-                    "delegateType": "market",
+                    "stopLossTriggerPrice": str(rounded_sl),
+                    "stopLossTriggerType": "fill_price",
+                    "stopLossExecutePrice": "0",  # 시장가 체결
                 })
             else:
                 ccxt_symbol = self._to_ccxt_symbol(symbol)
@@ -428,7 +424,12 @@ class AgentExchangeClient:
         try:
             await self._ensure_markets()
             ccxt_symbol = self._to_ccxt_symbol(symbol)
-            await self.exchange.cancel_all_orders(ccxt_symbol)
+            try:
+                await self.exchange.cancel_all_orders(ccxt_symbol)
+            except Exception as e:
+                # 22001 (No order to cancel) 등 에러는 무시
+                if "22001" not in str(e) and "No order" not in str(e):
+                    logger.warning(f"Failed to cancel regular orders for {symbol}: {e}")
 
             if self.exchange_id == "bitget":
                 # ccxt cancel_all_orders는 일반 주문만 취소 — plan(stop/TP) 주문은 네이티브 V2 API로 별도 취소
