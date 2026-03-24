@@ -317,8 +317,9 @@ class AgentExchangeClient:
             rounded_price = self.round_price(symbol, price)
             ccxt_symbol = self._to_ccxt_symbol(symbol)
             if self.exchange_id == "bitget":
-                # 단방향 모드 TP: holdSide 대신 side를 사용하며 planType은 profit_plan 고정
+                # 단방향 모드 TP: holdSide를 진입 방향("buy" 또는 "sell")으로 설정 (단방향 포지션 필수)
                 import time
+                hold_side = "buy" if side.lower() == "sell" else "sell"
                 resp = await self.exchange.private_mix_post_v2_mix_order_place_tpsl_order({
                     "symbol": symbol,
                     "productType": "USDT-FUTURES",
@@ -329,7 +330,7 @@ class AgentExchangeClient:
                     "triggerType": "fill_price",
                     "executePrice": str(rounded_price),
                     "size": str(rounded_qty),
-                    "side": side.lower(),
+                    "holdSide": hold_side,
                     "delegateType": "limit",
                 })
                 order_id = resp.get("data", {}).get("orderId", f"bitget_tp_{int(time.time())}")
@@ -378,17 +379,17 @@ class AgentExchangeClient:
                 if not position:
                     logger.warning(f"No position found to set SL for {symbol}")
                     return False
-                close_side = "sell" if position.side == "LONG" else "buy"
+                hold_side = "buy" if position.side == "LONG" else "sell"
                 await self.exchange.private_mix_post_v2_mix_order_place_tpsl_order({
                     "symbol": symbol,
                     "productType": "USDT-FUTURES",
                     "marginMode": "crossed",
                     "marginCoin": "USDT",
-                    "planType": "loss_plan",
+                    "planType": "pos_loss",
                     "triggerPrice": str(rounded_sl),
                     "triggerType": "fill_price",
                     "size": str(position.qty),
-                    "side": close_side,
+                    "holdSide": hold_side,
                     "delegateType": "market",
                 })
             else:
